@@ -1,0 +1,38 @@
+DATASET: 'scannet'
+BATCH_SIZE: 1
+SAVE_SCENE_MESH: True
+SAVE_INCREMENTAL: True
+VIS_INCREMENTAL: False
+REDUCE_GPU_MEM: True  # drastically reduces GPU memory and will slow down inference a bit.
+LOGDIR: 'logs_viz_one_scene_valset'
+SAVE_FREQ: 1
+MODE: 'val'
+#DEBUG: False
+
+TEST:
+  PATH: '/media/zhongad/2TB/dataset/scannet'
+  N_VIEWS: 9
+  N_WORKERS: 0
+
+MODEL:
+  DEPTH_PREDICTION: False
+  VIS_DEPTH: False
+  N_STAGE: 3
+  THRESHOLDS: [ 0, 0, 0 ]  # threshold for occupancy, that defines the sparsity for each stage
+  POS_WEIGHT: 1.5
+  N_VOX: [96, 96, 96]
+  VOXEL_SIZE: 0.04
+  TRAIN_NUM_SAMPLE: [4096, 16384, 65536]
+  TEST_NUM_SAMPLE: [4096, 16384, 65536]
+  BACKBONE2D:
+    ARC: 'fpn-mnas-1'
+  LW: [1.0, 0.8, 0.64]
+  LW_SEMSEG: [1.0, 0.8, 0.64]
+  FUSION:
+    FUSION_ON: True
+    FULL: True
+  CDR:
+    DEPTH_PRED: True  # mvsnet init depth prediction and point flow depth refinement
+    FEAT_REFMNT: True  # anchor occupancy refinement
+    SEMSEG_REFMNT: True  # semseg refmnt
+    SEMSEG_2D: True

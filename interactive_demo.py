@@ -7,11 +7,8 @@ This pkg serves for the arkit video demo, where the inputs are folders (/color, 
 import argparse
 import os
 import sys
-sys.path.append('/home/zhongad/3D_workspace/BestSemanticCDR/')
-
 from cdrnet_real_time_demo.arkit_live_demo.data_reader import DataReader
-from configs_realtime import update_config
-from configs_realtime import cfg
+from configs import update_config, cfg
 
 if __name__ == '__main__':
     os.environ['PYOPENGL_PLATFORM'] = 'egl'
@@ -19,7 +16,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='arkit demo on cdrnet')
     parser.add_argument('--cfg',
                         help='the config file name',
-                        default='configs_realtime/arkit_video_demo.yaml',
+                        default='configs/arkit_video_demo.yaml',
                         type=str)
     parser.add_argument('opts',
                         help="Modify config options using the command-line",

@@ -20,10 +20,10 @@
 
 from PIL import Image, ImageOps
 import numpy as np
-from utils import coordinates
 import transforms3d
 import torch
-from tools.tsdf_fusion.fusion import TSDFVolumeTorch
+from ops.tsdf_fusion import TSDFVolumeTorch
+from utils import coordinates, VALID_CLASS_IDS_NYU40, NYU40_COLORMAP
 
 
 class Compose(object):
@@ -43,19 +43,30 @@ class ToTensor(object):
 
     def __call__(self, data):
         data['imgs'] = torch.Tensor(np.stack(data['imgs']).transpose([0, 3, 1, 2]))
-        data['intrinsics'] = torch.Tensor(data['intrinsics'])
-        data['extrinsics'] = torch.Tensor(data['extrinsics'])
-        if 'depth' in data.keys():
-            data['depth'] = torch.Tensor(np.stack(data['depth']))
+        data['intrinsics'] = torch.Tensor(np.array(data['intrinsics']))
+        data['poses'] = torch.Tensor(np.array(data['poses']))
+        if 'labels' in data.keys():
+            raw_labels = np.stack(data['labels'])
+            nyu40_to_20_label_mapper = -np.ones(256)
+            for i, x in enumerate(VALID_CLASS_IDS_NYU40):
+                nyu40_to_20_label_mapper[
+                    x] = i  # map to (0-19), with less classification category, the miou should improve
+            labels = nyu40_to_20_label_mapper[raw_labels]
+            data['labels'] = torch.Tensor(labels).to(torch.long)
+        if 'depths' in data.keys():
+            data['depths'] = torch.Tensor(np.stack(data['depths']))
         if 'tsdf_list_full' in data.keys():
             for i in range(len(data['tsdf_list_full'])):
                 if not torch.is_tensor(data['tsdf_list_full'][i]):
                     data['tsdf_list_full'][i] = torch.Tensor(data['tsdf_list_full'][i])
-        # implicit conversion for semseg_list_full: np.int64 -> torch.float32
         if 'semseg_list_full' in data.keys():
             for i in range(len(data['semseg_list_full'])):
                 if not torch.is_tensor(data['semseg_list_full'][i]):
                     data['semseg_list_full'][i] = torch.Tensor(data['semseg_list_full'][i])
+        if 'links' in data.keys():
+            data['links_list'] = torch.from_numpy(data['links_list'])
+            data['pth_voxelize_coords_list'] = torch.from_numpy(data['pth_voxelize_coords_list'])
+
         return data
 
 
@@ -77,18 +88,20 @@ class IntrinsicsPoseToProjection(object):
         return rotation_matrix
 
     def __call__(self, data):
-        middle_pose = data['extrinsics'][self.nviews // 2]
+        # middle_pose = data['poses'][self.nviews // 2]
+        middle_pose = data['poses'][torch.div(self.nviews, 2, rounding_mode='trunc')]
         rotation_matrix = self.rotate_view_to_align_xyplane(middle_pose)
         rotation_matrix4x4 = np.eye(4)
         rotation_matrix4x4[:3, :3] = rotation_matrix
         data['world_to_aligned_camera'] = torch.from_numpy(rotation_matrix4x4).float() @ middle_pose.inverse()
 
         proj_matrices = []
-        for intrinsics, extrinsics in zip(data['intrinsics'], data['extrinsics']):
+        for intrinsics, poses in zip(data['intrinsics'], data['poses']):
             view_proj_matrics = []
             for i in range(3):
-                # from (camera to world) to (world to camera)
-                proj_mat = torch.inverse(extrinsics.data.cpu())
+                # from pose (camera to world) to camera extrinsics (world to camera)
+                # camera extrinsics actually means the extrinsic part of camera projection (proj_mat=KP)
+                proj_mat = torch.inverse(poses.data.cpu())
                 scale_intrinsics = intrinsics / self.stride / 2 ** i
                 scale_intrinsics[-1, -1] = 1
                 proj_mat[:3, :4] = scale_intrinsics @ proj_mat[:3, :4]
@@ -96,12 +109,13 @@ class IntrinsicsPoseToProjection(object):
             view_proj_matrics = torch.stack(view_proj_matrics)
             proj_matrices.append(view_proj_matrics)
         data['proj_matrices'] = torch.stack(proj_matrices)
-        data.pop('intrinsics')
-        data.pop('extrinsics')
+        # if vis depth, K and P cannot be pop out
+        # data.pop('intrinsics')
+        # data.pop('poses')
         return data
 
 
-def pad_scannet(img, intrinsics):
+def pad_scannet_img(img, intrinsics):
     """ Scannet imported are 1296x968 but 1296x972 is 4x3
     so we pad vertically 4 pixels to make it 4x3
     """
@@ -110,6 +124,8 @@ def pad_scannet(img, intrinsics):
     if w == 1296 and h == 968:
         img = ImageOps.expand(img, border=(0, 2))
         intrinsics[1, 2] += 2
+    else:
+        raise ValueError
     return img, intrinsics
 
 
@@ -125,7 +141,7 @@ class ResizeImage(object):
 
     def __call__(self, data):
         for i, im in enumerate(data['imgs']):
-            im, intrinsics = pad_scannet(im, data['intrinsics'][i])
+            im, intrinsics = pad_scannet_img(im, data['intrinsics'][i])
             w, h = im.size
             im = im.resize(self.size, Image.BILINEAR)
             intrinsics[0, :] /= (w / self.size[0])
@@ -140,84 +156,64 @@ class ResizeImage(object):
         return self.__class__.__name__ + '(size={0})'.format(self.size)
 
 
-class InstanceToSemseg(object):
-    """  Map to benchmark classes.
-        * Used in label_semseg_gt.label_scene() only at this point, preprocess and store in npz,
-            so no need to transform again in runtime
-        * (no need) transformed 2d frame semseg data for training and testing.
-        Calling returns a tsdf_vol, not like in atlas return the data dict.
+class ResizeImageAndLabel(object):
+    """ Resize everything to given size.
+
+    Intrinsics are assumed to refer to image prior to resize.
+    After resize everything (ex: depth) should have the same intrinsics.
+
+    Image are resized, and label will be resized in to the target size if needed.
+
     """
 
-    def __init__(self, mapping=None):
-        if mapping is None:
-            self.mapping = None
-        elif mapping == 'nyu40':
-            self.mapping = {'scannet': self.load_scannet_nyu40_mapping()}
-        else:
-            raise NotImplementedError('dataset mapping %s)' % mapping)
+    def __init__(self, size, label_already_resized=True):
+        self.size = size
+        # refer to scannet setup in __getitem__()
+        self.label_already_resized = label_already_resized
 
     def __call__(self, data):
-        """
-        Analyzing data[key]['instance'], return to data['semseg'].
-        @param data: data dict
-        @return: data dict with new appended key-value pair for semseg
-        """
-        # map tsdfs from group_id into raw_id, then to semseg_id
-        for key in data:
-            if key[:3] == 'vol' and 'instance' in data[key]:
-                instance = data[key]['instance']  # voxel 3d instance ids
-                semseg = -torch.ones_like(instance)
-                for group_id, raw_id in data['instances'].items():
-                    if self.mapping is not None:
-                        # map from raw id to training id (ex:nyu40)
-                        semseg_id = self.mapping[data['dataset']][raw_id]
-                    semseg[instance == group_id] = semseg_id
-                data['semseg'] = semseg
+        for i, im in enumerate(data['imgs']):
+            im, intrinsics = pad_scannet_img(im, data['intrinsics'][i].copy())
+            w, h = im.size
+            im = im.resize(self.size, Image.BILINEAR)
+            intrinsics[0, :] /= (w / self.size[0])
+            intrinsics[1, :] /= (h / self.size[1])
+
+            if not self.label_already_resized:
+                lb = data['labels'][i]
+                # in pad_scannet(), im.size() == lb.size() is asserted
+                lb = lb.resize(self.size, Image.NEAREST)
+                data['labels'][i] = np.array(lb, dtype=np.uint8)
+
+            data['imgs'][i] = np.array(im, dtype=np.float32)
+            data['intrinsics'][i] = intrinsics
 
         return data
 
-    def load_scannet_nyu40_mapping(self, path='/media/zhongad/2TB/dataset/scannet'):
-        """ Returns a dict mapping scannet Ids to NYU40 Ids
-
-        Args:
-            path: Path to the original scannet data.
-                This is used to get scannetv2-labels.combined.tsv
-
-        Returns:
-            mapping: A dict from ints to ints
-                example:
-                    {1: 1,
-                     2: 5,
-                     22: 23}
-
-        """
-        import os
-        import csv
-        mapping = {}
-        with open(os.path.join(path, 'scannetv2-labels.combined.tsv')) as tsvfile:
-            tsvreader = csv.reader(tsvfile, delimiter='\t')
-            for i, line in enumerate(tsvreader):
-                if i == 0:
-                    continue
-                raw_id, nyu40id = int(line[0]), int(line[4])
-                mapping[raw_id] = nyu40id
-        return mapping
+    def __repr__(self):
+        return self.__class__.__name__ + '(size={0})'.format(self.size)
 
 
 class RandomTransformSpace(object):
     """ Apply a random 3x4 linear transform to the world coordinate system.
         This affects pose as well as TSDFs.
+
+        The pose augmentation here change the input pose. For each epoch, rotate randomly around z-axis, and translate randomly for the t vector.
+        Since the whole epoch is with the same augmentation, different random augmentation on different epochs should increase the learning capability of the training.
+
+        Notice that, link matrix is also handled here, if random transform is done for data[pose, vol_origin, tsdf, occ, semseg].
     """
 
     def __init__(self, voxel_dim, voxel_size, random_rotation=True, random_translation=True,
-                 paddingXY=1.5, paddingZ=.25, origin=[0, 0, 0], max_epoch=999, max_depth=3.0):
+                 paddingXY=1.5, paddingZ=.25, link_fbv_bound_creation=False,
+                 origin=[0, 0, 0], max_epoch=999, max_depth=3.0):
         """
         Args:
             voxel_dim: tuple of 3 ints (nx,ny,nz) specifying
                 the size of the output volume
             voxel_size: floats specifying the size of a voxel
-            random_rotation: wheater or not to apply a random rotation
-            random_translation: wheater or not to apply a random translation
+            random_rotation: whether or not to apply a random rotation
+            random_translation: whether or not to apply a random translation
             paddingXY: amount to allow croping beyond maximum extent of TSDF
             paddingZ: amount to allow croping beyond maximum extent of TSDF
             origin: origin of the voxel volume (xyz position of voxel (0,0,0))
@@ -239,14 +235,16 @@ class RandomTransformSpace(object):
         self.random_r = torch.rand(max_epoch)
         self.random_t = torch.rand((max_epoch, 3))
 
+        self.link_fbv_conversion = link_fbv_bound_creation
+
     def __call__(self, data):
         origin = torch.Tensor(data['vol_origin'])
         if (not self.random_rotation) and (not self.random_translation):
             T = torch.eye(4)
         else:
-            # construct rotaion matrix about z axis
+            # construct rotaion matrix around z axis
             if self.random_rotation:
-                r = self.random_r[data['epoch'][0]] * 2 * np.pi
+                r = self.random_r[0] * 2 * np.pi
             else:
                 r = 0
             # first construct it in 2d so we can rotate bounding corners in the plane
@@ -278,18 +276,35 @@ class RandomTransformSpace(object):
             end = (-torch.Tensor(voxel_dim) * self.voxel_size +
                    torch.Tensor([xmax, ymax, zmax]) + self.padding_end)
             if self.random_translation:
-                t = self.random_t[data['epoch'][0]]
+                t = self.random_t[0]
             else:
                 t = .5
             t = t * start + (1 - t) * end - origin
 
             T = torch.eye(4)
 
-            T[:2, :2] = R
+            T[:2, :2] = R  # random rot mat R around z-axis
             T[:3, 3] = -t
 
-        for i in range(len(data['extrinsics'])):
-            data['extrinsics'][i] = T @ data['extrinsics'][i]
+        # # record the original fbv bounds for semseg_link conversion
+        # # since global_link is constructed based on the gt mesh, no random rotation here
+        # if self.link_fbv_conversion:
+        #     bnds = torch.zeros((3, 2))
+        #     bnds[:, 0] = np.inf  # minimum
+        #     bnds[:, 1] = -np.inf  # maximum
+        #     for i in range(data['imgs'].shape[0]):
+        #         size = data['imgs'][i].shape[1:]
+        #         cam_intr = data['intrinsics'][i]
+        #         cam_pose = data['poses'][i]
+        #         view_frust_pts = get_view_frustum(self.max_depth, size, cam_intr, cam_pose)
+        #
+        #         # accumulate and get the bounds for this FBV
+        #         bnds[:, 0] = torch.min(bnds[:, 0], torch.min(view_frust_pts, dim=1)[0])
+        #         bnds[:, 1] = torch.max(bnds[:, 1], torch.max(view_frust_pts, dim=1)[0])
+        #     data['fbv_bnds'] = bnds
+
+        for i in range(len(data['poses'])):
+            data['poses'][i] = T @ data['poses'][i]
 
         data['vol_origin'] = torch.tensor(self.origin, dtype=torch.float, device=T.device)
 
@@ -301,12 +316,16 @@ class RandomTransformSpace(object):
                   align_corners=False):
         """ Applies a 3x4 linear transformation to the TSDF & Semseg.
 
+        Update for FBV link mat:
+        The link mat needed to be included into FBV coord just like this update,
+        otherwise, cannot work with current FBV volume training
+
         Each voxel is moved according to the transformation and a new volume
         is constructed with the result.
 
         Args:
             data: items from data loader
-            transform: 4x4 linear transform
+            transform: 4x4 linear transform for camera extrinsics (pose inverse)
             old_origin: origin of the voxel volume (xyz position of voxel (0, 0, 0))
                 default (None) is the same as the input
             align_corners:
@@ -318,16 +337,21 @@ class RandomTransformSpace(object):
 
         # ----------computing visual frustum hull------------
         bnds = torch.zeros((3, 2))
-        bnds[:, 0] = np.inf
-        bnds[:, 1] = -np.inf
+        bnds[:, 0] = np.inf  # minimum
+        bnds[:, 1] = -np.inf  # maximum
 
         for i in range(data['imgs'].shape[0]):
             size = data['imgs'][i].shape[1:]
             cam_intr = data['intrinsics'][i]
-            cam_pose = data['extrinsics'][i]
+            cam_pose = data['poses'][i]
             view_frust_pts = get_view_frustum(self.max_depth, size, cam_intr, cam_pose)
+
+            # accumulate and get the bounds for this FBV
             bnds[:, 0] = torch.min(bnds[:, 0], torch.min(view_frust_pts, dim=1)[0])
             bnds[:, 1] = torch.max(bnds[:, 1], torch.max(view_frust_pts, dim=1)[0])
+
+            if self.link_fbv_conversion:
+                data['fbv_bnds'] = bnds
 
         # -------adjust volume bounds using the frames in this frag-------
         num_layers = 3
@@ -336,7 +360,8 @@ class RandomTransformSpace(object):
         center[:2] = torch.round(center[:2] / 2 ** num_layers) * 2 ** num_layers
         center[2] = torch.floor(center[2] / 2 ** num_layers) * 2 ** num_layers
         origin = torch.zeros_like(center)
-        origin[:2] = center[:2] - torch.tensor(self.voxel_dim[:2]) // 2
+        # origin[:2] = center[:2] - torch.tensor(self.voxel_dim[:2]) // 2
+        origin[:2] = center[:2] - torch.div(torch.tensor(self.voxel_dim[:2]), 2, rounding_mode='trunc')
         origin[2] = center[2]
         vol_origin_partial = origin * self.voxel_size + data['vol_origin']
 
@@ -360,13 +385,13 @@ class RandomTransformSpace(object):
 
             for l, (tsdf_s, semseg_s) in enumerate(zip(data['tsdf_list_full'], data['semseg_list_full'])):
                 # ------get partial tsdf and occ-------
-                vol_dim_s = torch.tensor(self.voxel_dim) // 2 ** l
+                vol_dim_s = torch.div(torch.tensor(self.voxel_dim), 2 ** l, rounding_mode='trunc')
                 tsdf_vol = TSDFVolumeTorch(vol_dim_s, vol_origin_partial,
                                            voxel_size=self.voxel_size * 2 ** l, margin=3)
                 for i in range(data['imgs'].shape[0]):
-                    depth_im = data['depth'][i]
+                    depth_im = data['depths'][i]
                     cam_intr = data['intrinsics'][i]
-                    cam_pose = data['extrinsics'][i]
+                    cam_pose = data['poses'][i]
 
                     tsdf_vol.integrate(depth_im, cam_intr, cam_pose, obs_weight=1.)
 
@@ -379,13 +404,15 @@ class RandomTransformSpace(object):
                 dim_s = list(coords_world_s.shape[1:])
                 coords_world_s = coords_world_s.view(3, -1)
 
+                # data['fbv_voxelized_coords_s'].append(coords_world_s)
+
                 old_voxel_dim = list(tsdf_s.shape)
 
                 coords_world_s = 2 * coords_world_s / (torch.Tensor(old_voxel_dim) - 1).view(3, 1) - 1
                 coords_world_s = coords_world_s[[2, 1, 0]].T.view([1] + dim_s + [3])
 
-                # bilinear interpolation near surface,
-                # no interpolation along -1,1 boundry
+                # both bilinear and nearest interpolation near surface, to create fbv tsdf
+                # no interpolation along -1,1 boundary
                 tsdf_vol = torch.nn.functional.grid_sample(
                     tsdf_s.view([1, 1] + old_voxel_dim),
                     coords_world_s, mode='nearest', align_corners=align_corners
@@ -403,6 +430,11 @@ class RandomTransformSpace(object):
                 mask = (coords_world_s.abs() >= 1).squeeze(0).any(3)
                 tsdf_vol[mask] = 1
 
+                # # after tsdf_vol is processed with src bilinear/nearest interpolation given coord within fbv
+                # fred_occ_vol = torch.ones_like(tsdf_vol).bool()
+                # fred_occ_vol[tsdf_vol == 1.0] = False
+                # data['occ_list'].append(fred_occ_vol)
+
                 data['tsdf_list'].append(tsdf_vol)
                 data['occ_list'].append(occ_vol)
 
@@ -412,11 +444,17 @@ class RandomTransformSpace(object):
                     semseg_s.view([1, 1] + old_voxel_dim), coords_world_s,
                     mode='nearest', align_corners=align_corners
                 ).squeeze()
+                # semseg_vol_bilinear = torch.nn.functional.grid_sample(
+                #     semseg_s.view([1, 1] + old_voxel_dim), coords_world_s, mode='bilinear',
+                #     align_corners=align_corners).squeeze()
+                # semseg_vol[mask] = semseg_vol_bilinear[mask]
+                # mask out the non-surface also as -1, conform with scannet.nyu40_to_20_label_mapper()
+                semseg_vol[mask] = -1
+
                 data['semseg_list'].append(semseg_vol)
 
             data.pop('semseg_list_full')
             data.pop('tsdf_list_full')
-            data.pop('depth')
         data.pop('epoch')
         return data
 
@@ -449,48 +487,3 @@ def get_view_frustum(max_depth, size, cam_intr, cam_pose):
     ])
     view_frust_pts = rigid_transform(view_frust_pts.T, cam_pose).T
     return view_frust_pts
-
-
-NYU40_COLORMAP = [
-    (0, 0, 0),
-    (174, 199, 232),  # wall
-    (152, 223, 138),  # floor
-    (31, 119, 180),  # cabinet
-    (255, 187, 120),  # bed
-    (188, 189, 34),  # chair
-    (140, 86, 75),  # sofa
-    (255, 152, 150),  # table
-    (214, 39, 40),  # door
-    (197, 176, 213),  # window
-    (148, 103, 189),  # bookshelf
-    (196, 156, 148),  # picture
-    (23, 190, 207),  # counter
-    (178, 76, 76),
-    (247, 182, 210),  # desk
-    (66, 188, 102),
-    (219, 219, 141),  # curtain
-    (140, 57, 197),
-    (202, 185, 52),
-    (51, 176, 203),
-    (200, 54, 131),
-    (92, 193, 61),
-    (78, 71, 183),
-    (172, 114, 82),
-    (255, 127, 14),  # refrigerator
-    (91, 163, 138),
-    (153, 98, 156),
-    (140, 153, 101),
-    (158, 218, 229),  # shower curtain
-    (100, 125, 154),
-    (178, 127, 135),
-    (120, 185, 128),
-    (146, 111, 194),
-    (44, 160, 44),  # toilet
-    (112, 128, 144),  # sink
-    (96, 207, 209),
-    (227, 119, 194),  # bathtub
-    (213, 92, 176),
-    (94, 106, 211),
-    (82, 84, 163),  # otherfurn
-    (100, 85, 144)
-]
