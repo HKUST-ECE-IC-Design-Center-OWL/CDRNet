@@ -167,9 +167,8 @@ def inference(loadckpt):
 
 
 if __name__ == '__main__':
-    ckpt_path = 'model_000049.ckpt' if cfg.LOADCKPT is None else cfg.LOADCKPT
     frag_len = len(inference_loader)
-    loss_mean, tsdf_mean, semseg_mean, duration = inference(loadckpt=ckpt_path)
+    loss_mean, tsdf_mean, semseg_mean, duration = inference(loadckpt=cfg.LOADCKPT)
     summary_text = f"""
             Summary:
                 Total number of fragments: {frag_len} 

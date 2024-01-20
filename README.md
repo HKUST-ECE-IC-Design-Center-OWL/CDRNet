@@ -1,7 +1,7 @@
 # CDRNet (ICCV 2023 Workshops)
 This is a repository for the paper _Cross-Dimensional Refined Learning for Real-Time 3D Visual Perception from Monocular Video_.
 ### [Project Page](https://hafred.github.io/cdrnet/) | [Paper](https://openaccess.thecvf.com/content/ICCV2023W/JRDB/papers/Hong_Cross-Dimensional_Refined_Learning_for_Real-Time_3D_Visual_Perception_from_Monocular_ICCVW_2023_paper.pdf) | [Poster](https://github.com/stanfordironman/cdrnet.torch.2023ICCV/blob/main/iccv23_poster_cdrnet_final.pdf)
-![CDRNet Real-Time Demo](assets/cdrnet_github.gif)
+![CDRNet Real-Time Demo](assets/cdrnet.gif)
 
 ## Run Inference
 ```bash

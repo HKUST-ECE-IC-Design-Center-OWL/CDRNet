@@ -1,10 +1,11 @@
 DATASET: 'scannet'
 BATCH_SIZE: 1
 SAVE_SCENE_MESH: True
-SAVE_INCREMENTAL: True
+SAVE_INCREMENTAL: False
 VIS_INCREMENTAL: False
 REDUCE_GPU_MEM: True  # drastically reduces GPU memory and will slow down inference a bit.
 LOGDIR: 'logs_viz_one_scene_valset'
+LOADCKPT: 'model_000049.ckpt'
 SAVE_FREQ: 1
 MODE: 'val'
 #DEBUG: False
