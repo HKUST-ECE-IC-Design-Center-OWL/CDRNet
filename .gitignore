@@ -3,7 +3,6 @@
 imported_data
 checkpoints
 ckpt
-data/
 results/
 incremental_results/
 outputs
